@@ -1,0 +1,4 @@
+﻿sc create WeeklyRestartService binPath= "C:\Services\WeeklyRestartService\WeeklyRestartService.exe" start= auto
+sc start WeeklyRestartService
+sc delete WeeklyRestartService
+sc stop WeeklyRestartService
