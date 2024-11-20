@@ -1,6 +1,11 @@
+using Microsoft.Extensions.Hosting;
 using Microsoft.Win32;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 public class Worker : BackgroundService
@@ -10,7 +15,6 @@ public class Worker : BackgroundService
     private readonly DayOfWeek scheduledDay;
     private readonly TimeSpan restartTime;
 
-    private bool screenAwake = false;
     private DateTime lastRestartTime = DateTime.MinValue;
 
     public Worker(IConfiguration configuration)
@@ -34,88 +38,123 @@ public class Worker : BackgroundService
     {
         if (e.Mode == PowerModes.Resume)
         {
-            LogEvent("System resumed from sleep/hibernate. Preparing to take screenshot.");
-            screenAwake = true;
+            LogEvent("System resumed from sleep/hibernate.");
+            TakeScreenshot("SystemResume");
         }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        LogEvent("Service started, monitoring for scheduled restarts and user activities.");
-
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            DateTime now = DateTime.Now;
+            LogRestartMarkerOnStartup(); // Log the last restart marker if available
+            LogEvent("Service started, monitoring for scheduled restarts and user activities.");
 
-            // Monitor for user login
-            if (Environment.UserInteractive && lastRestartTime != DateTime.MinValue)
+            bool userLoginHandled = false; // Flag to ensure user login actions are handled only once
+            bool userRestartHandled = false; // Flag to ensure user-triggered restart actions are handled only once
+
+            while (!stoppingToken.IsCancellationRequested)
             {
-                LogEvent("User has logged in. Creating logs after a minute...");
-                await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
-                TakeScreenshot("UserLogin");
-                LogProcessesAndApplications("UserLogin");
-            }
+                try
+                {
+                    DateTime now = DateTime.Now;
 
-            // Check for scheduled restart
-            if (now.DayOfWeek == scheduledDay && now.TimeOfDay >= restartTime && now.TimeOfDay < restartTime.Add(TimeSpan.FromMinutes(1)))
-            {
-                LogEvent("Scheduled restart time reached.");
-                TakeScreenshot("BeforeRestart");
-                LogProcessesAndApplications("BeforeRestart");
-                await PerformRestartSequence();
-            }
+                    // Monitor for user login
+                    if (Environment.UserInteractive && lastRestartTime != DateTime.MinValue && !userLoginHandled)
+                    {
+                        LogEvent("User login detected. Creating logs and taking a screenshot...");
+                        await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken); // Allow time for login stabilization
+                        TakeScreenshot("UserLogin");
+                        LogProcessesAndApplications("UserLogin");
+                        userLoginHandled = true; // Mark login handling as complete
+                    }
 
-            // Monitor for user-triggered restart
-            if (Environment.TickCount < 150000 && lastRestartTime != DateTime.MinValue)
-            {
-                LogEvent("Detected user-triggered restart.");
-                TakeScreenshot("UserRestart");
-                LogProcessesAndApplications("UserRestart");
-                lastRestartTime = DateTime.Now;
-            }
+                    // Check for scheduled restart
+                    if (IsScheduledRestartDue(now))
+                    {
+                        LogEvent("Scheduled restart time reached.");
+                        TakeScreenshot("BeforeRestart");
+                        LogProcessesAndApplications("BeforeRestart");
+                        await PerformRestartSequence();
 
-            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+                        // Reset flags after a restart
+                        userLoginHandled = false;
+                        userRestartHandled = false;
+                    }
+
+                    // Monitor for user-triggered restart
+                    if (Environment.TickCount < 150000 && lastRestartTime != DateTime.MinValue && !userRestartHandled)
+                    {
+                        LogEvent("Detected user-triggered restart.");
+                        await Task.Delay(TimeSpan.FromSeconds(20), stoppingToken); // Allow time for post-restart stabilization
+                        TakeScreenshot("UserRestart");
+                        LogProcessesAndApplications("UserRestart");
+                        userRestartHandled = true; // Mark restart handling as complete
+                        lastRestartTime = DateTime.Now; // Update the last restart time
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(20), stoppingToken); // Short interval for responsiveness
+                }
+                catch (Exception ex)
+                {
+                    LogEvent($"Error in service loop: {ex.Message}\n{ex.StackTrace}");
+                }
+            }
+        }
+        catch {
+            LogEvent($"Error in service loop:Service is restarting.");
         }
     }
 
+    private bool IsScheduledRestartDue(DateTime now)
+    {
+        return now.DayOfWeek == scheduledDay &&
+               now.TimeOfDay >= restartTime &&
+               now.TimeOfDay < restartTime.Add(TimeSpan.FromMinutes(1));
+    }
 
     private async Task PerformRestartSequence()
     {
         try
         {
-            LogEvent("Scheduled restart triggered.");
+            LogEvent("Performing scheduled restart.");
 
-            LogProcessesAndApplications("BeforeRestart");
+            //LogProcessesAndApplications("BeforeRestart");
             //TakeScreenshot("BeforeRestart");
 
+            LogEvent("Service is stopping. System will restart shortly.");
+            RecordRestartMarker(); // Write restart marker to a file
             Process.Start("shutdown", "/r /t 30");
-            LogEvent("System restart command issued.");
             lastRestartTime = DateTime.Now;
 
-            await Task.Delay(TimeSpan.FromMinutes(1)); // Wait for restart
-            LogEvent("Wait for restart.");
-            // Simulate post-restart actions
-            await Task.Delay(TimeSpan.FromMinutes(3));
-
-            LogProcessesAndApplications("AfterRestart");
-            //TakeScreenshot("AfterRestart");
-
-            LogEvent("Scheduled restart completed successfully.");
+            await Task.Delay(TimeSpan.FromMinutes(3)); // Simulate waiting for restart
         }
         catch (Exception ex)
         {
-            LogEvent($"Error during scheduled restart: {ex.Message}\n{ex.StackTrace}");
+            LogEvent($"Error during restart sequence: {ex.Message}\n{ex.StackTrace}");
         }
     }
 
-    //private bool IsScheduledRestartDue()
-    //{
-    //    var now = DateTime.Now;
-    //    return now.DayOfWeek == scheduledDay &&
-    //           now.TimeOfDay >= restartTime &&
-    //           now.TimeOfDay < restartTime.Add(TimeSpan.FromMinutes(1)) &&
-    //           lastRestartTime.Date != now.Date;
-    //}
+    private void RecordRestartMarker()
+    {
+        string filePath = Path.Combine(logPath, "RestartMarker.txt");
+        File.WriteAllText(filePath, $"Last restart: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        LogEvent($"Restart marker written to file: {filePath}");
+    }
+
+    private void LogRestartMarkerOnStartup()
+    {
+        string filePath = Path.Combine(logPath, "RestartMarker.txt");
+        if (File.Exists(filePath))
+        {
+            string restartMarker = File.ReadAllText(filePath);
+            LogEvent($"Service resumed after restart. {restartMarker}");
+            LogProcessesAndApplications("AfterRestart");
+            TakeScreenshot("AfterRestart");
+
+            File.Delete(filePath); // Clean up after reading
+        }
+    }
 
     private void TakeScreenshot(string prefix)
     {
